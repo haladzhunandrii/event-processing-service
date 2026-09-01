@@ -1,6 +1,21 @@
 # Transaction Event Service
 
-A small Python/FastAPI service for asynchronous transaction ingestion. It is sized for the requested roughly 100 events/second with short bursts around 1,000/sec.
+Asynchronous transaction ingestion sized for roughly 100 events/second with short bursts around 1,000/sec.
+
+## Project layout
+
+```
+app/
+├── main.py                 # FastAPI entrypoint
+├── config.py               # Pydantic settings
+├── domain/                 # models, schemas, exceptions
+├── services/               # processor, queries, publisher
+├── infrastructure/         # database, redis, queue, metrics
+├── api/routes/             # HTTP handlers
+└── worker/                 # stream consumer
+tests/unit/                 # default pytest target
+tests/integration/          # requires docker compose
+```
 
 ## Run locally
 
@@ -8,31 +23,52 @@ A small Python/FastAPI service for asynchronous transaction ingestion. It is siz
 docker compose up --build
 ```
 
-Submit an event (the worker normally processes it immediately):
+Submit an event:
 
 ```bash
-curl -X POST http://localhost:8000/events -H "Content-Type: application/json" -d '{"id":"tx-1","user_id":"u-42","amount":"100.00","currency":"EUR","timestamp":"2026-08-31T12:00:00Z"}'
+curl -X POST http://localhost:8000/events -H "Content-Type: application/json" \
+  -d '{"id":"tx-1","user_id":"u-42","amount":"100.00","currency":"EUR","timestamp":"2026-08-31T12:00:00Z"}'
 curl http://localhost:8000/users/u-42/summary
 curl "http://localhost:8000/users/u-42/transactions?from=2026-08-01T00:00:00Z&to=2026-09-01T00:00:00Z"
 curl http://localhost:8000/metrics
 ```
 
-The local rate table seeds USD=1, EUR=1.08, and UAH=0.024 on first start. It intentionally models rate lookup as a database dependency, so a database outage naturally exercises retry behavior. In a real deployment, a separately operated rate-ingestion process would maintain this table.
+The local rate table seeds USD=1, EUR=1.08, and UAH=0.024 on first start. A database outage exercises retry behavior because rates are loaded from PostgreSQL.
 
-Run unit tests without Docker after installing dependencies:
+Run unit tests:
 
 ```bash
+pip install -r requirements-dev.txt
 pytest -q
+```
+
+Run integration tests (stack must be up):
+
+```bash
+pytest -m integration
+```
+
+After schema changes (e.g. new indexes), reset volumes:
+
+```bash
+docker compose down -v
 ```
 
 ## Design choices
 
-**Queue:** Redis Streams with AOF persistence and a consumer group. It keeps the HTTP path quick and durable, supports pending-message recovery, and is very simple to run in Compose. PostgreSQL is the source of truth for processed transactions.
+**Queue:** Redis Streams with AOF persistence and a consumer group. The HTTP path stays fast and durable; pending messages can be reclaimed; Compose stays simple. PostgreSQL is the source of truth for processed transactions.
 
-**Delivery semantics: at-least-once.** The worker writes the transaction in a DB transaction, then acknowledges the stream message. It never acknowledges a failed message. If it crashes after commit but before acknowledgement, Redis redelivers it; the transaction id is PostgreSQL's primary key, so that duplicate has no effect. This is the practical trade-off instead of distributed exactly-once transactions across Redis and PostgreSQL.
+**Delivery semantics: at-least-once.** The worker commits to PostgreSQL, then acknowledges the stream message. It never acknowledges a failed transient message. A crash after commit but before ack causes redelivery; the transaction `id` is the primary key, so duplicates are ignored.
 
-Failures of PostgreSQL or the rate query leave the message pending and retry with exponential backoff (2s through 60s). A worker restart retains both the pending message and retry state. A replacement worker can claim stale pending messages by configuring Redis consumer recovery; for this compact single-worker deployment, Compose restarts the same worker and it resumes its own pending entries.
+**Error handling:**
+- *Transient* (DB/Redis outages): exponential backoff (2s–60s), up to 10 attempts, then dead-letter stream.
+- *Permanent* (validation errors, unsupported currency): immediate DLQ + ack (no infinite retry).
+- *Duplicate*: ack without incrementing `events_processed`.
 
-**One trade-off:** Redis Streams is an operationally lightweight queue but does not offer Kafka's partitioned replay and long-term retention. At 10× load, I would move to Kafka (partitioned by `user_id`), run multiple consumer replicas, use managed/replicated Redis or remove it entirely, and maintain rates with a provider-backed cache plus observability/alerts.
+**Metrics:** The worker writes counters to Redis (`metrics:*` keys). The API `/metrics` endpoint reads them via a custom Prometheus collector (sync Redis client). `queue_lag` is approximate when multiple workers run (last writer wins).
 
-The `/metrics` endpoint exposes Prometheus counters for processed events and failures plus a pending-message lag gauge.
+**One trade-off:** Redis Streams is lightweight but lacks Kafka-style partitioned replay and long retention. At 10× load I would move to Kafka (partition by `user_id`), scale workers horizontally (`docker compose up --scale worker=3`), add a composite index on `(user_id, timestamp)`, use provider-backed rate caching, and add Alembic migrations instead of `create_all`.
+
+## Public repository
+
+https://github.com/haladzhunandrii/event-processing-service
